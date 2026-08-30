@@ -7,6 +7,8 @@ start:
     mov ds, ax ; zero out ds
     mov es, ax ; zero out es
 
+    call enable_a20
+
     mov si, message   ; SI will walk through the string, byte by byte
 
 print_loop:
@@ -54,6 +56,16 @@ gdt_descriptor:
 
 hang:
     jmp $
+
+enable_a20:
+    in al, 0x92    ; read a byte from I/O port 0x92
+    test al, 2     ; check if bit 1 (value 2) is already set
+    jnz after      ; if A20 is already enabled, skip re-toggling it
+    or al, 2       ; set bit 1 (the enable bit) without touching other bits
+    and al, 0xFE   ; clear bit 0
+    out 0x92, al   ; write the modified byte back out to the port, taking effect
+after:
+    ret
 
 message: db "Hello, World!", 0
 
