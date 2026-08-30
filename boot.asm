@@ -11,6 +11,7 @@
 ; Memory layout:
 ;
 ;   0x7C00  -> boot sector loaded by the BIOS
+;   0x10000 -> test sector loaded from disk
 ;   0x90000 -> stack used while in real mode
 ;   0xB8000 -> VGA text-mode video memory
 ;
@@ -19,6 +20,11 @@
 ;   selector 0x00 -> null descriptor
 ;   selector 0x08 -> 32-bit code segment
 ;   selector 0x10 -> 32-bit data segment
+;
+; Disk layout:
+;
+;   sector 1 -> this bootloader
+;   sector 2 -> test data loaded by load_sectors
 ;
 ; ============================================================================
 
@@ -32,6 +38,10 @@ org 0x7C00
 ; ============================================================================
 
 start:
+    ; Disable interrupts while we initialize the stack.
+    ; We do not want an interrupt to occur before SS:SP is ready.
+    cli
+
     ; Clear AX so we can use it to initialize the segment registers.
     xor ax, ax
 
@@ -40,7 +50,7 @@ start:
     mov ds, ax
 
     ; Point ES at physical address 0x00000 as well.
-    ; We are not using ES yet, but initializing it keeps the environment sane.
+    ; ES will later be changed temporarily when loading the test sector.
     mov es, ax
 
     ; Set the real-mode stack segment to zero.
@@ -50,11 +60,6 @@ start:
     ; Set SP to 0x9000.
     ; With SS = 0, the stack begins around physical address 0x9000.
     mov sp, 0x9000
-
-    ; Disable interrupts while we finish setting up the boot environment.
-    ; We do not want an interrupt occurring while the stack or CPU state is
-    ; being changed.
-    cli
 
     ; Save the BIOS-provided boot drive number.
     ; BIOS places the boot drive in DL when it enters the boot sector.
@@ -71,6 +76,63 @@ start:
     ; Print the message while we are still in real mode.
     ; BIOS interrupt 0x10 is only being used before protected mode is enabled.
     call print_string
+
+
+    ; =========================================================================
+    ; LOAD TEST SECTOR
+    ; =========================================================================
+
+    ; Set ES to 0x1000 so ES:BX points to physical address 0x10000.
+    ; This is safely away from the bootloader at 0x7C00.
+    mov ax, 0x1000
+
+    ; Use AX as an intermediate register because segment registers cannot
+    ; normally be loaded directly from an immediate value.
+    mov es, ax
+
+    ; Set BX to zero.
+    ; Therefore ES:BX = 0x1000:0x0000 = physical address 0x10000.
+    xor bx, bx
+
+    ; Load one sector from disk into ES:BX.
+    ; load_sectors always loads sector 2, which is the sector immediately
+    ; following this boot sector.
+    call load_sectors
+
+    ; Restore DS to zero.
+    ; print_string expects SI to point into the segment selected by DS.
+    xor ax, ax
+    mov ds, ax
+
+    ; Put the physical address of the loaded test string into SI.
+    ; The test sector was loaded at physical address 0x10000, so with DS = 0
+    ; we can access it by using an offset of 0x10000.
+    ;
+    ; In 16-bit real mode an offset cannot exceed 0xFFFF, so instead we
+    ; temporarily make DS point at the loaded sector below.
+    mov ax, 0x1000
+    mov ds, ax
+
+    ; The test string begins at offset zero inside the loaded sector.
+    xor si, si
+
+    ; Print the string that was actually read from disk.
+    ; This proves that int 0x13 loaded sector 2 into memory successfully.
+    call print_string
+
+    ; Restore DS to physical address 0x00000.
+    ; The remaining bootloader labels and GDT are based on this segment.
+    xor ax, ax
+    mov ds, ax
+
+    ; Restore ES to physical address 0x00000.
+    ; We no longer need ES to point at the loaded test sector.
+    mov es, ax
+
+
+    ; =========================================================================
+    ; ENTER PROTECTED MODE
+    ; =========================================================================
 
     ; Load the Global Descriptor Table.
     ; The CPU needs a GDT before protected-mode segment selectors can be used.
@@ -134,6 +196,82 @@ print_string:
 .done:
     ; Return to the caller once the null terminator is reached.
     ret
+
+
+; ============================================================================
+; DISK LOADING
+; ============================================================================
+
+load_sectors:
+    ; BIOS disk service 0x02 expects AH = 0x02.
+    ; This service reads one or more sectors using CHS addressing.
+    mov ah, 0x02
+
+    ; Tell BIOS to read exactly one sector.
+    ; We use a hardcoded count because this routine is specifically being used
+    ; to load our one-sector test payload.
+    mov al, 0x01
+
+    ; Select cylinder 0.
+    ; Our test data is located in the first track of the disk image.
+    mov ch, 0x00
+
+    ; Select sector 2.
+    ; Sector numbering starts at 1, so sector 2 is immediately after the
+    ; boot sector (sector 1).
+    mov cl, 0x02
+
+    ; Select head 0.
+    ; Together with cylinder 0 and sector 2, this identifies our test sector.
+    mov dh, 0x00
+
+    ; Restore the boot drive supplied by the BIOS.
+    ; BIOS expects the drive number in DL for int 0x13.
+    mov dl, [boot_drive]
+
+    ; ES:BX is deliberately left untouched here.
+    ; The caller is responsible for choosing the destination memory address.
+    ;
+    ; At this point the registers look like:
+    ;
+    ;   AH = 0x02 -> read sectors
+    ;   AL = 0x01 -> read one sector
+    ;   CH = 0x00 -> cylinder 0
+    ;   CL = 0x02 -> sector 2
+    ;   DH = 0x00 -> head 0
+    ;   DL = boot drive
+    ;   ES:BX     -> destination supplied by caller
+    int 0x13
+
+    ; BIOS sets CF if the disk operation failed.
+    ; Check it immediately because later instructions may change the flags.
+    jc disk_error
+
+    ; Return to the caller after the sector was successfully loaded.
+    ret
+
+
+; ============================================================================
+; DISK ERROR
+; ============================================================================
+
+disk_error:
+    ; Load the address of the disk-error message into SI.
+    mov si, disk_error_message
+
+    ; Print the error message using the same BIOS teletype routine used by the
+    ; normal boot messages.
+    call print_string
+
+.disk_hang:
+    ; Stop executing after a disk failure.
+    ; There is no useful way for this tiny bootloader to continue without the
+    ; sector it was trying to load.
+    cli
+    hlt
+
+    ; Keep the CPU here if HLT ever resumes for any reason.
+    jmp .disk_hang
 
 
 ; ============================================================================
@@ -321,7 +459,7 @@ protected_mode_start:
 
     ; Write a third character to the screen.
     mov byte [0xB8004], '!'
-    
+
     ; Give the third character the same color.
     mov byte [0xB8005], 0x0F
 
@@ -357,13 +495,23 @@ DATA_SEG equ gdt_data - gdt_start
 ; ============================================================================
 
 message:
-    ; String printed by the BIOS before entering protected mode.
+
+    ; String printed by the BIOS before loading sector 2.
     ; The final zero is the null terminator used by print_string.
-    db "Entering protected mode...", 0
+    db "Loading sector 2...", 0
+
+
+disk_error_message:
+
+    ; String printed if BIOS reports a disk-read failure.
+    ; This gives us an obvious indication that int 0x13 failed.
+    db "DISK ERROR!", 0
+
 
 boot_drive:
+
     ; One byte reserved for the BIOS boot-drive number.
-    ; We save DL here even though this code does not need the value later.
+    ; We save DL here because BIOS provides the drive number in DL.
     db 0
 
 
@@ -378,3 +526,32 @@ times 510 - ($ - $$) db 0
 ; Standard boot-sector signature.
 ; BIOS recognizes 0xAA55 as a valid bootable sector signature.
 dw 0xAA55
+
+
+; ============================================================================
+; SECTOR 2 TEST DATA
+; ============================================================================
+;
+; Everything below the boot signature is no longer part of the boot sector.
+; It is the second 512-byte sector in the disk image.
+;
+; load_sectors reads this sector using:
+;
+;   cylinder = 0
+;   head     = 0
+;   sector   = 2
+;
+; The string starts at offset 0, so after loading it at 0x1000:0000,
+; print_string can simply use SI = 0.
+;
+; ============================================================================
+
+sector2_data:
+
+    ; Known test string.
+    ; If this appears on screen, we know the BIOS successfully read sector 2.
+    db "SECTOR 2 LOADED SUCCESSFULLY!", 0
+
+    ; Fill the rest of sector 2 with zeroes.
+    ; The test sector must be exactly 512 bytes.
+    times 512 - ($ - sector2_data) db 0
